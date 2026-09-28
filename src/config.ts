@@ -5,8 +5,8 @@
  * a normalized, fully-populated runtime config object.
  */
 import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export type JsonRecord = Record<string, unknown>;
 
@@ -87,7 +87,9 @@ export function toStringList(value: unknown): string[] | undefined {
 }
 
 export function loadConfig(cwd: string): Required<ExtensionConfig> {
-  const globalPath = join(homedir(), ".pi", "agent", "openai-server-compaction.json");
+  // Global config lives in Pi's agent directory, so PI_CODING_AGENT_DIR and a
+  // relocated agent dir behave here exactly as they do in the rest of Pi.
+  const globalPath = join(getAgentDir(), "openai-server-compaction.json");
   const projectPath = join(cwd, ".pi", "openai-server-compaction.json");
   const globalCfg = readJsonFile(globalPath) ?? {};
   const projectCfg = readJsonFile(projectPath) ?? {};

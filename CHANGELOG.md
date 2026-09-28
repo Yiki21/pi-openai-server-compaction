@@ -15,6 +15,20 @@ This changelog intentionally starts at **0.1.0**.
 - add a fixed-context, information-density-calibrated product-defaults benchmark comparing Pi's real default compactor with the extension's real native replay policy
 - correct the earlier benchmark's same-budget interpretation: its text cap was selected after observing native output usage
 
+## 0.2.1 - 2026-09-28
+
+### Fix global config path resolution
+
+`loadConfig()` resolved the global config at a hardcoded `homedir()/.pi/agent/`,
+ignoring `PI_CODING_AGENT_DIR`. Under a relocated agent directory it therefore
+read the wrong file — or none — so `proxyProviders` and `compactionReasoningEffort`
+silently fell back to defaults while the request still went through the gateway
+path by env var. Now resolved through Pi's own `getAgentDir()`.
+
+The import is safe at runtime because Pi aliases `@earendil-works/pi-coding-agent`
+for extension modules (`dist/core/extensions/loader.js`), which is also how the
+existing `src/remote-compaction.ts` imports `compact`/`convertToLlm`.
+
 ## 0.2.0 - 2026-09-28
 
 First release of the `@yiki21/pi-openai-server-compaction` fork.

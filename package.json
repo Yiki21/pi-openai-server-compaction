@@ -1,6 +1,6 @@
 {
   "name": "@yiki21/pi-openai-server-compaction",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Pi extension for Codex-style Responses remote compaction, including OpenAI-compatible gateways. Fork of algal/pi-openai-server-compaction.",
   "license": "MIT",
