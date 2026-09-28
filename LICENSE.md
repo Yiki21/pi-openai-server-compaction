@@ -1,6 +1,7 @@
 MIT License
 
-Copyright (c) 2026 Alexis Gallagher
+Copyright (c) 2026 Alexis Gallagher (original work)
+Copyright (c) 2026 Yiki21 (fork modifications)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

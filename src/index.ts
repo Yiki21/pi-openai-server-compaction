@@ -10,11 +10,13 @@ import { isRecord, loadConfig } from "./config.ts";
 import { streamOpenAIResponsesWithPhase2B } from "./custom-stream.ts";
 import {
   applyPayloadPatch,
+  applyProxiedHistoryPayloadPatch,
   applyRemoteHistoryPayloadPatch,
   extractAssistantResponseId,
   extractResponsesReasoningConfig,
   extractResponsesTextConfig,
   isOpenAICodexResponsesModel,
+  isProxiedOpenAIResponsesModel,
   looksLikeResponsesPayload,
   messageMatchesModel,
   modelKey,
@@ -29,9 +31,11 @@ import {
   buildToolsPayload,
   callRemoteCompactionEndpoint,
   generateBestEffortLocalSummary,
+  isDiscardedAssistantMessage,
   messageToResponseItems,
   messagesToResponseItems,
   normalizeResponseItemsForPrompt,
+  projectBranchMessageEntries,
   reconstructRemoteCompactionStateFromBranch,
 } from "./remote-compaction.ts";
 import {
@@ -53,7 +57,7 @@ type BranchEntry = {
   type: string;
   id: string;
   details?: unknown;
-  message?: unknown;
+  message?: AgentMessage;
   thinkingLevel?: unknown;
 };
 
@@ -69,9 +73,9 @@ function getSessionId(ctx: SessionContextLike): string {
 }
 
 function getBranchMessages(branchEntries: BranchEntry[]): AgentMessage[] {
-  return branchEntries.flatMap((entry) =>
-    entry.type === "message" && entry.message ? [entry.message as AgentMessage] : [],
-  );
+  // Project the branch the way the model sees it: context-edit omissions drop
+  // out and discarded assistant attempts never reach the backend.
+  return projectBranchMessageEntries(branchEntries).map((entry) => entry.message);
 }
 
 function getBranchMessageCount(branchEntries: BranchEntry[]): number {
@@ -133,6 +137,7 @@ function extendRemoteHistoryIfCompatible(params: {
   if (params.message.role === "assistant" && !messageMatchesModel(params.message, params.model)) {
     return;
   }
+  if (isDiscardedAssistantMessage(params.message)) return;
 
   const items = messageToResponseItems(params.message);
   if (items.length === 0) return;
@@ -202,7 +207,7 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
   pi.on("session_before_compact", async (event, ctx) => {
     const cfg = loadConfig(ctx.cwd);
     const model = ctx.model;
-    if (!cfg.enabled || !model || !supportsRemoteCompactionModel(model)) return undefined;
+    if (!cfg.enabled || !model || !supportsRemoteCompactionModel(model, cfg)) return undefined;
 
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
     if (!auth.ok || !auth.apiKey) return undefined;
@@ -221,7 +226,11 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
     const fallbackReasoning = model.reasoning
       ? thinkingLevelToResponsesReasoning(thinkingLevel ?? getBranchThinkingLevel(branchEntries))
       : undefined;
-    const reasoning = observedRequestShape?.reasoning ?? fallbackReasoning;
+    const observedReasoning = observedRequestShape?.reasoning ?? fallbackReasoning;
+    const reasoning =
+      model.reasoning && cfg.compactionReasoningEffort
+        ? { ...observedReasoning, effort: cfg.compactionReasoningEffort }
+        : observedReasoning;
     const text = observedRequestShape?.text;
 
     const [localResult, remoteResult] = await Promise.allSettled([
@@ -249,6 +258,7 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
         reasoning,
         text,
         signal: event.signal,
+        cfg,
       }),
     ]);
 
@@ -333,6 +343,25 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
     if (isOpenAICodexResponsesModel(model)) {
       if (!remoteState) return undefined;
       const payload = applyRemoteHistoryPayloadPatch({
+        payload: event.payload,
+        explicitHistory: normalizeResponseItemsForPrompt(remoteState.explicitHistory, model) as unknown[],
+      });
+      maybeNotifyRequestFeatures({
+        notifiedModels,
+        hasUI: ctx.hasUI,
+        notify: cfg.notify,
+        ui: ctx.ui,
+        model,
+        features: ["remote_compaction_history"],
+      });
+      return payload;
+    }
+
+    if (isProxiedOpenAIResponsesModel(model, cfg)) {
+      // Replay only. The payload is otherwise left exactly as Pi built it:
+      // store stays false, and no context_management / previous_response_id.
+      if (!remoteState) return undefined;
+      const payload = applyProxiedHistoryPayloadPatch({
         payload: event.payload,
         explicitHistory: normalizeResponseItemsForPrompt(remoteState.explicitHistory, model) as unknown[],
       });

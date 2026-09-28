@@ -370,4 +370,197 @@ assert.deepEqual(incrementalInput, [
   },
 ]);
 
+const {
+  applyProxiedHistoryPayloadPatch,
+  isProxiedOpenAIResponsesModel,
+  isDirectOpenAIResponsesModel,
+  supportsRemoteCompactionModel,
+  sanitizeProviderHeaders,
+} = await import(pathToFileURL(join(repoRoot, "src", "openai.ts")).href);
+const {
+  isDiscardedAssistantMessage,
+  projectBranchMessageEntries,
+} = await import(pathToFileURL(join(repoRoot, "src", "remote-compaction.ts")).href);
+
+// ---------------------------------------------------------------------------
+// Proxied-provider support
+// ---------------------------------------------------------------------------
+
+const proxyModel = {
+  api: "openai-responses",
+  provider: "example-gateway",
+  id: "gpt-5.6-sol",
+  baseUrl: "https://gateway.example.com/v1",
+};
+const directModel = {
+  api: "openai-responses",
+  provider: "openai",
+  id: "gpt-5.6-sol",
+  baseUrl: "https://api.openai.com/v1",
+};
+const cfg = { proxyProviders: ["example-gateway"] };
+const emptyCfg = { proxyProviders: [] };
+
+// A gateway is only eligible when the user named it, and never becomes a
+// "direct OpenAI" model — that predicate gates store/context_management/WS.
+assert.equal(isProxiedOpenAIResponsesModel(proxyModel, cfg), true, "declared gateway should be eligible");
+assert.equal(isProxiedOpenAIResponsesModel(proxyModel, emptyCfg), false, "undeclared provider must stay ineligible");
+assert.equal(isProxiedOpenAIResponsesModel(directModel, cfg), false, "the built-in openai provider is not a gateway");
+assert.equal(isProxiedOpenAIResponsesModel({ ...proxyModel, api: "anthropic-messages" }, cfg), false, "wrong wire format must be rejected");
+assert.equal(isDirectOpenAIResponsesModel(proxyModel), false, "a gateway must never take the direct-OpenAI path");
+assert.equal(supportsRemoteCompactionModel(proxyModel, cfg), true);
+assert.equal(supportsRemoteCompactionModel(proxyModel, emptyCfg), false);
+assert.equal(supportsRemoteCompactionModel(directModel, emptyCfg), true);
+assert.equal(
+  remoteCompactionV2EndpointUrl(proxyModel, cfg),
+  "https://gateway.example.com/v1/responses",
+  "gateway endpoint should reuse the Responses path at its own base URL",
+);
+
+// null means "delete this header" in Pi's header map; it must not be sent as the
+// literal string "null", and it must not reach buildRemoteCompactionHeaders' output.
+assert.deepEqual(sanitizeProviderHeaders({ a: "1", b: null, c: undefined }), { a: "1" });
+const gatewayHeaders = buildRemoteCompactionHeaders({
+  model: proxyModel,
+  apiKey: "sk-test",
+  headers: { "x-custom": "yes", "x-delete": null },
+  sessionId: "session-1",
+  cfg,
+});
+assert.equal(gatewayHeaders.authorization, "Bearer sk-test");
+assert.equal(gatewayHeaders["x-custom"], "yes");
+assert.equal("x-delete" in gatewayHeaders, false, "null headers must be dropped");
+assert.equal(
+  "x-codex-installation-id" in gatewayHeaders,
+  false,
+  "gateway requests must not carry Codex machine identity headers",
+);
+assert.equal("x-codex-beta-features" in gatewayHeaders, false);
+
+// The Responses adapter keeps the system prompt as the first `input` item, so a
+// replay that replaces the whole array silently drops it.
+const proxiedPatch = applyProxiedHistoryPayloadPatch({
+  payload: {
+    model: "gpt-5.6-sol",
+    input: [
+      { role: "developer", content: "SYSTEM_PROMPT_TEXT" },
+      { role: "user", content: "old turn" },
+    ],
+    store: false,
+    context_management: [{ type: "compaction", compact_threshold: 1 }],
+    previous_response_id: "resp_stale",
+  },
+  explicitHistory: [{ type: "compaction", encrypted_content: "OPAQUE" }],
+});
+assert.deepEqual(proxiedPatch.input, [
+  { role: "developer", content: "SYSTEM_PROMPT_TEXT" },
+  { type: "compaction", encrypted_content: "OPAQUE" },
+]);
+assert.equal(proxiedPatch.store, false, "gateway requests must not be switched to store: true");
+assert.equal(
+  proxiedPatch.context_management !== undefined,
+  true,
+  "pre-existing payload fields are left untouched by the replay patch",
+);
+assert.equal("previous_response_id" in proxiedPatch, false, "a stale response id must be dropped");
+
+// context_edit omissions and exhausted-retry turns must not return to remote history.
+const replayEntries = [
+  {
+    type: "compaction",
+    id: "cmp-2",
+    details: {
+      remoteCompaction: {
+        version: 2,
+        provider: "openai-responses-compaction",
+        implementation: "responses_compaction_v2",
+        modelKey: targetModelKey,
+        replacementHistory: [{ type: "compaction", encrypted_content: "OPAQUE" }],
+      },
+    },
+  },
+  {
+    type: "message",
+    id: "user-keep",
+    message: { role: "user", content: [{ type: "text", text: "VISIBLE_USER" }] },
+  },
+  {
+    type: "message",
+    id: "assistant-omitted",
+    message: {
+      role: "assistant",
+      provider: "openai",
+      api: "openai-responses",
+      model: "gpt-5.4-nano",
+      content: [{ type: "text", text: "OMITTED_REPLY" }],
+    },
+  },
+  { type: "context_edit", id: "edit-1", targetId: "assistant-omitted", replacement: null },
+  {
+    type: "message",
+    id: "assistant-failed",
+    message: {
+      role: "assistant",
+      provider: "openai",
+      api: "openai-responses",
+      model: "gpt-5.4-nano",
+      stopReason: "error",
+      content: [{ type: "text", text: "FAILED_REPLY" }],
+    },
+  },
+  {
+    // The retry that finally succeeded. Only this one may flush the pending user turn.
+    type: "message",
+    id: "assistant-retried",
+    message: {
+      role: "assistant",
+      provider: "openai",
+      api: "openai-responses",
+      model: "gpt-5.4-nano",
+      stopReason: "stop",
+      content: [{ type: "text", text: "GOOD_REPLY" }],
+    },
+  },
+];
+const projectedReplay = projectBranchMessageEntries(replayEntries).map((entry) => entry.id);
+assert.deepEqual(
+  projectedReplay,
+  ["user-keep", "assistant-retried"],
+  "omitted and failed turns must be projected away",
+);
+assert.equal(
+  isDiscardedAssistantMessage({ role: "assistant", stopReason: "aborted", content: [] }),
+  true,
+);
+assert.equal(isDiscardedAssistantMessage({ role: "user", content: [] }), false);
+
+const replayState = reconstructRemoteCompactionStateFromBranch({ branchEntries: replayEntries });
+const replayStateJson = JSON.stringify(replayState?.explicitHistory ?? []);
+assert.match(replayStateJson, /VISIBLE_USER/);
+assert.match(replayStateJson, /GOOD_REPLY/);
+assert.doesNotMatch(replayStateJson, /OMITTED_REPLY/, "a context-edited turn must not be replayed");
+assert.doesNotMatch(replayStateJson, /FAILED_REPLY/, "a discarded attempt must not be replayed");
+assert.equal(
+  (replayStateJson.match(/VISIBLE_USER/g) ?? []).length,
+  1,
+  "the user turn must be flushed exactly once, by the successful retry",
+);
+
+// A content replacement is applied rather than ignored.
+const replacedEntries = projectBranchMessageEntries([
+  {
+    type: "message",
+    id: "u1",
+    message: { role: "user", content: [{ type: "text", text: "ORIGINAL" }] },
+  },
+  {
+    type: "context_edit",
+    id: "e1",
+    targetId: "u1",
+    replacement: { content: [{ type: "text", text: "REPLACED" }] },
+  },
+]);
+assert.equal(JSON.stringify(replacedEntries).includes("REPLACED"), true);
+assert.equal(JSON.stringify(replacedEntries).includes("ORIGINAL"), false);
+
 console.log("smoke ok");

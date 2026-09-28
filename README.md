@@ -1,5 +1,12 @@
 # pi-openai-server-compaction
 
+> **Fork notice.** This is [`@yiki21/pi-openai-server-compaction`](https://www.npmjs.com/package/@yiki21/pi-openai-server-compaction),
+> a fork of [algal/pi-openai-server-compaction](https://github.com/algal/pi-openai-server-compaction).
+> It adds opt-in support for OpenAI-compatible **gateway and reseller** providers
+> (see [Gateway and reseller providers](#gateway-and-reseller-providers)), `context_edit`-aware
+> history replay, and Pi 0.87 compatibility. Everything else is the original work of
+> Alexis Gallagher; the benchmark findings below are his.
+
 This is a Pi extension which adds **Codex-style remote compaction** for OpenAI models, giving you better continuity across compaction boundaries while preserving all of Pi's normal features.
 
 What does that mean? Why would you want it? My impression has been that Codex compacts better than Claude Code and better than Pi. And I supposed this was because Codex compacts by using OpenAI's server-side Responses compaction protocol. That protocol sends a `compaction_trigger` through `POST /v1/responses` and receives an encrypted `compaction` item. This extension configures Pi to use that protocol for OpenAI models alongside Pi's native compaction logic.
@@ -49,25 +56,78 @@ https://x.com/alexisgallagher/status/2042396986327060736?s=20 .)
 | `openai/*`            | Yes                         | Yes                               | Yes                              | Yes         |
 | `openai-codex/*`      | Yes                         | No (built-in transport retained)  | No (built-in transport retained) | Yes         |
 | Azure                 | Partial (opt-in via config) | Partial                           | No                               | No          |
+| Gateway / reseller (opt-in) | Yes                   | No                                | No                               | Yes         |
+
+### Gateway and reseller providers
+
+Some gateways expose the OpenAI Responses wire format at their own base URL. List
+such a provider id in `proxyProviders` to enable remote compaction and history
+replay for it:
+
+```json
+{
+  "proxyProviders": ["my-gateway"],
+  "usePreviousResponseId": false
+}
+```
+
+Only two behaviors follow from a `proxyProviders` entry: the extension calls
+Responses compaction v2 through that provider's own `/responses` path, and it
+replays the returned opaque history on later compatible turns.
+
+The direct-OpenAI request patches stay off deliberately, because their failure
+mode on a third-party backend is silent rather than loud:
+
+- `store: true` is not set, so conversation data is not retained server-side by this extension
+- `context_management` (server-side compaction) is not added
+- `previous_response_id` continuity is not used — a gateway may route each request to a
+  different upstream, so a response id captured in one request is not guaranteed to
+  resolve in the next
+- the WebSocket transport is not registered
+
+The replay patch also preserves the leading `developer`/`system` item of `input`.
+The `openai-responses` adapter keeps the system prompt there rather than in a
+top-level `instructions` field, so replacing `input` wholesale would drop it —
+and the backend accepts the resulting request without complaint.
+
+This path was live-tested against a commercial OpenAI-compatible gateway
+(a Responses-protocol reseller, `gpt-5.6-sol`):
+compaction returned one opaque `compaction` item, replay recalled a fact that
+existed **only** inside that item (absent from the replayed plaintext), and it did
+so across 8/8 consecutive replays of the same item.
+
+Two caveats worth knowing before you rely on it:
+
+- A tampered `encrypted_content` was accepted without an error by the gateway tested.
+  If a backend silently fails to decrypt an item, the replayed context is quietly
+  missing content and nothing surfaces it. Check recall after your first compaction.
+- The same opaque item is not portable across providers or accounts. Switching the
+  model or provider stops replay until a fresh compaction runs on the new one.
 
 ## Install
 
-Project-local (recommended):
+From npm (global):
 
 ```bash
-pi install -l git:github.com/algal/pi-openai-server-compaction
+pi install npm:@yiki21/pi-openai-server-compaction
 ```
 
-Global:
+Project-local (recommended for a first trial):
 
 ```bash
-pi install git:github.com/algal/pi-openai-server-compaction
+pi install -l npm:@yiki21/pi-openai-server-compaction
+```
+
+From this fork's Git repository:
+
+```bash
+pi install git:github.com/Yiki21/pi-openai-server-compaction
 ```
 
 One-shot, non-persistent:
 
 ```bash
-git clone https://github.com/algal/pi-openai-server-compaction.git
+git clone https://github.com/Yiki21/pi-openai-server-compaction.git
 cd pi-openai-server-compaction && npm install
 pi -e ./src/index.ts --model openai/gpt-5.6-luna
 ```
@@ -75,7 +135,10 @@ pi -e ./src/index.ts --model openai/gpt-5.6-luna
 ## Requirements
 
 - Node `>= 22`
-- Pi `>=0.80.9 <0.81.0`
+- Pi `>=0.80.9 <0.88.0`. The fork's gateway path is live-tested on 0.87.1. The
+  direct-OpenAI and Codex paths were live-tested upstream on 0.80.9; the fork's
+  `context_edit` projection also applies to them, but has only been covered by the
+  offline smoke test there.
 - Auth/config for the model you want to use must already work in Pi
 - A supported OpenAI Responses model, e.g. `openai/gpt-5.6-sol` or `openai-codex/gpt-5.6-sol`
 
@@ -134,9 +197,16 @@ Config is read from:
   "thresholdRatio": 0.7,
   "compactThreshold": 0,
   "usePreviousResponseId": true,
-  "notify": false
+  "notify": false,
+  "proxyProviders": [],
+  "compactionReasoningEffort": null
 }
 ```
+
+`compactionReasoningEffort` (`"none" | "minimal" | "low" | "medium" | "high" | "xhigh"`)
+overrides the reasoning effort for the remote compaction request only. The default
+`null` mirrors the last observed turn, which under a high session thinking level
+makes compaction the slowest request of the run.
 
 Environment overrides:
 
@@ -148,6 +218,8 @@ Environment overrides:
 | `PI_OPENAI_SERVER_COMPACTION_RATIO`                | Compact threshold as ratio of context window (default: 0.7) |
 | `PI_OPENAI_SERVER_COMPACTION_PREVIOUS_RESPONSE_ID` | Enable/disable `previous_response_id`                       |
 | `PI_OPENAI_SERVER_COMPACTION_NOTIFY`               | Show UI notifications when features activate                |
+| `PI_OPENAI_SERVER_COMPACTION_PROXY_PROVIDERS`      | Comma-separated gateway provider ids                        |
+| `PI_OPENAI_SERVER_COMPACTION_REASONING_EFFORT`     | Reasoning effort for the remote compaction request          |
 
 ## Troubleshooting
 

@@ -4,6 +4,7 @@
  * Keeps provider-specific detection, request patching, endpoint classification,
  * and model-key logic out of the higher-level extension wiring.
  */
+import type { ProviderHeaders } from "@earendil-works/pi-ai";
 import type { ExtensionConfig, JsonRecord } from "./config.ts";
 import type { ResponsesReasoningConfig, ResponsesTextConfig } from "./remote-compaction.ts";
 import { isRecord, toPositiveInteger } from "./config.ts";
@@ -18,6 +19,24 @@ export type ModelLike = {
   reasoning?: unknown;
   input?: readonly unknown[];
 };
+
+type PreviousResponseIdConfig = Pick<ExtensionConfig, "includeAzure">;
+
+type EligibilityConfig = { proxyProviders?: readonly string[] | undefined } | undefined;
+
+/**
+ * Pi >= 0.87 types provider headers as `Record<string, string | null>`, where a
+ * `null` value means "delete this header". A raw `fetch` has no such convention,
+ * so nulls are dropped instead of being sent as the string "null".
+ */
+export function sanitizeProviderHeaders(
+  headers: ProviderHeaders | undefined,
+): Record<string, string> {
+  if (!headers) return {};
+  return Object.fromEntries(
+    Object.entries(headers).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+  );
+}
 
 type AssistantMessageLike = {
   role?: unknown;
@@ -69,6 +88,24 @@ export function isAzureOpenAIResponsesModel(model: ModelLike): boolean {
   return typeof host === "string" && host.endsWith(".openai.azure.com");
 }
 
+/**
+ * A non-`openai` provider id that the user has declared Responses-compatible.
+ *
+ * Only two things follow from this: remote compaction, and replaying the
+ * resulting opaque history. The direct-OpenAI request patches and the
+ * WebSocket transport explicitly do NOT — see `proxyProviders` in config.ts.
+ */
+export function isProxiedOpenAIResponsesModel(
+  model: unknown,
+  cfg: EligibilityConfig,
+): model is ModelLike {
+  if (!isRecord(model)) return false;
+  if (model.api !== "openai-responses") return false;
+  const provider = typeof model.provider === "string" ? model.provider : "";
+  if (!provider || provider === "openai" || provider === "azure-openai") return false;
+  return (cfg?.proxyProviders ?? []).includes(provider);
+}
+
 export function isOpenAICodexResponsesModel(model: ModelLike): boolean {
   if (model.api !== "openai-codex-responses") return false;
   const provider = typeof model.provider === "string" ? model.provider : "";
@@ -79,16 +116,23 @@ export function isOpenAICodexResponsesModel(model: ModelLike): boolean {
 
 export function supportsPreviousResponseId(
   model: unknown,
-  cfg: Required<ExtensionConfig>,
+  cfg: PreviousResponseIdConfig,
 ): model is ModelLike {
   if (!isOpenAIResponsesModel(model)) return false;
   if (isDirectOpenAIResponsesModel(model)) return true;
-  return cfg.includeAzure && isAzureOpenAIResponsesModel(model);
+  return Boolean(cfg.includeAzure) && isAzureOpenAIResponsesModel(model);
 }
 
-export function supportsRemoteCompactionModel(model: unknown): model is ModelLike {
+export function supportsRemoteCompactionModel(
+  model: unknown,
+  cfg: EligibilityConfig,
+): model is ModelLike {
   if (!isOpenAIResponsesModel(model)) return false;
-  return isDirectOpenAIResponsesModel(model) || isOpenAICodexResponsesModel(model);
+  return Boolean(
+    isDirectOpenAIResponsesModel(model) ||
+    isOpenAICodexResponsesModel(model) ||
+    isProxiedOpenAIResponsesModel(model, cfg),
+  );
 }
 
 export function resolveCompactThreshold(
@@ -159,6 +203,41 @@ export function applyRemoteHistoryPayloadPatch(params: {
   const nextPayload: JsonRecord = {
     ...params.payload,
     input: params.explicitHistory,
+  };
+  delete nextPayload.messages;
+  delete nextPayload.previous_response_id;
+  return nextPayload;
+}
+
+/**
+ * History replay for a gateway/reseller provider.
+ *
+ * Differs from the Codex patch above in one way that matters: the `openai-responses`
+ * adapter keeps the system prompt as the *first item of `input`* (a `developer`
+ * message) rather than in a top-level `instructions` field. Replacing `input`
+ * wholesale therefore throws the system prompt away, which the backend accepts
+ * without complaint. Keep the leading block and replace only what follows.
+ *
+ * `previous_response_id` is always dropped: a proxied backend may route each
+ * request to a different upstream, so a response id captured here is not
+ * guaranteed to resolve later.
+ */
+export function applyProxiedHistoryPayloadPatch(params: {
+  payload: JsonRecord;
+  explicitHistory: unknown[];
+}): JsonRecord {
+  const input = Array.isArray(params.payload.input) ? params.payload.input : [];
+  const leadingBlock: unknown[] = [];
+  for (const item of input) {
+    if (!isRecord(item)) break;
+    const role = item.role;
+    if (role !== "developer" && role !== "system") break;
+    leadingBlock.push(item);
+  }
+
+  const nextPayload: JsonRecord = {
+    ...params.payload,
+    input: [...leadingBlock, ...params.explicitHistory],
   };
   delete nextPayload.messages;
   delete nextPayload.previous_response_id;

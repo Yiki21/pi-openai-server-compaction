@@ -1,25 +1,34 @@
 {
-  "name": "pi-openai-server-compaction",
-  "version": "0.1.0",
-  "private": true,
+  "name": "@yiki21/pi-openai-server-compaction",
+  "version": "0.2.0",
   "type": "module",
-  "description": "Pi extension for OpenAI server-side compaction with Codex-quality continuity.",
+  "description": "Pi extension for Codex-style Responses remote compaction, including OpenAI-compatible gateways. Fork of algal/pi-openai-server-compaction.",
   "license": "MIT",
+  "author": "Yiki21",
+  "contributors": [
+    "Alexis Gallagher (original author, https://github.com/algal)"
+  ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/algal/pi-openai-server-compaction.git"
+    "url": "git+https://github.com/Yiki21/pi-openai-server-compaction.git"
   },
-  "homepage": "https://github.com/algal/pi-openai-server-compaction#readme",
+  "homepage": "https://github.com/Yiki21/pi-openai-server-compaction#readme",
   "bugs": {
-    "url": "https://github.com/algal/pi-openai-server-compaction/issues"
+    "url": "https://github.com/Yiki21/pi-openai-server-compaction/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "keywords": [
     "pi-package",
     "pi-extension",
+    "pi-coding-agent",
     "openai",
     "responses",
     "compaction",
-    "codex"
+    "context-compaction",
+    "codex",
+    "gateway"
   ],
   "engines": {
     "node": ">=22"
@@ -38,9 +47,9 @@
     "extensions": ["./src/index.ts"]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.80.9 <0.81.0",
-    "@earendil-works/pi-ai": ">=0.80.9 <0.81.0",
-    "@earendil-works/pi-agent-core": ">=0.80.9 <0.81.0"
+    "@earendil-works/pi-coding-agent": ">=0.80.9 <0.88.0",
+    "@earendil-works/pi-ai": ">=0.80.9 <0.88.0",
+    "@earendil-works/pi-agent-core": ">=0.80.9 <0.88.0"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-coding-agent": { "optional": true },

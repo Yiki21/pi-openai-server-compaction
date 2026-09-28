@@ -10,6 +10,10 @@ import { join } from "node:path";
 
 export type JsonRecord = Record<string, unknown>;
 
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+const REASONING_EFFORTS: readonly ReasoningEffort[] = ["none", "minimal", "low", "medium", "high", "xhigh"];
+
 export type ExtensionConfig = {
   enabled?: boolean;
   includeAzure?: boolean;
@@ -17,6 +21,22 @@ export type ExtensionConfig = {
   thresholdRatio?: number;
   notify?: boolean;
   usePreviousResponseId?: boolean;
+  /**
+   * Extra provider ids that speak the OpenAI Responses wire format but are not
+   * `openai` itself — typically a gateway or reseller in front of it.
+   *
+   * These get remote compaction and history replay only. `store: true`,
+   * `context_management`, `previous_response_id`, and the WebSocket transport
+   * stay off: they are direct-OpenAI optimizations whose failure mode on a
+   * third-party backend is silent context corruption rather than an error.
+   */
+  proxyProviders?: string[];
+  /**
+   * Reasoning effort for the remote compaction request only. `null` keeps the
+   * upstream behavior of mirroring the last observed turn, which under a high
+   * session thinking level makes compaction the slowest request of the run.
+   */
+  compactionReasoningEffort?: ReasoningEffort | null;
 };
 
 export function isRecord(value: unknown): value is JsonRecord {
@@ -52,6 +72,20 @@ function toPositiveNumber(value: unknown): number | undefined {
   return undefined;
 }
 
+export function toStringList(value: unknown): string[] | undefined {
+  const parts = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(",")
+      : undefined;
+  if (!parts) return undefined;
+  const cleaned = parts
+    .filter((part): part is string => typeof part === "string")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return cleaned.length > 0 ? [...new Set(cleaned)] : undefined;
+}
+
 export function loadConfig(cwd: string): Required<ExtensionConfig> {
   const globalPath = join(homedir(), ".pi", "agent", "openai-server-compaction.json");
   const projectPath = join(cwd, ".pi", "openai-server-compaction.json");
@@ -84,7 +118,23 @@ export function loadConfig(cwd: string): Required<ExtensionConfig> {
       toBoolean(process.env.PI_OPENAI_SERVER_COMPACTION_PREVIOUS_RESPONSE_ID) ??
       toBoolean(merged.usePreviousResponseId) ??
       true,
+    proxyProviders:
+      toStringList(process.env.PI_OPENAI_SERVER_COMPACTION_PROXY_PROVIDERS) ??
+      toStringList(merged.proxyProviders) ??
+      [],
+    compactionReasoningEffort:
+      toReasoningEffort(process.env.PI_OPENAI_SERVER_COMPACTION_REASONING_EFFORT) ??
+      toReasoningEffort(merged.compactionReasoningEffort) ??
+      null,
   };
+}
+
+function toReasoningEffort(value: unknown): ReasoningEffort | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  return (REASONING_EFFORTS as readonly string[]).includes(normalized)
+    ? (normalized as ReasoningEffort)
+    : undefined;
 }
 
 export function toPositiveInteger(value: unknown): number | undefined {

@@ -21,14 +21,21 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { calculateCost, type Model, type Usage } from "@earendil-works/pi-ai";
 import { complete } from "@earendil-works/pi-ai/compat";
+import type { ProviderHeaders } from "@earendil-works/pi-ai";
 import { isRecord } from "./config.ts";
+import type { ExtensionConfig } from "./config.ts";
 import {
   hostnameFromBaseUrl,
   isDirectOpenAIResponsesModel,
   isOpenAICodexResponsesModel,
+  isProxiedOpenAIResponsesModel,
+  sanitizeProviderHeaders,
   supportsRemoteCompactionModel,
   modelKey,
 } from "./openai.ts";
+
+// Optional so existing callers that predate gateway support keep compiling.
+type EligibilityConfig = Pick<ExtensionConfig, "proxyProviders"> | undefined;
 
 type CompactionPreparation = SessionBeforeCompactEvent["preparation"];
 type AssistantPhase = "commentary" | "final_answer";
@@ -124,8 +131,13 @@ function resolveCodexResponsesEndpoint(model: Model<any>): string {
   return `${baseUrl}/codex/responses`;
 }
 
-export function remoteCompactionV2EndpointUrl(model: Model<any>): string {
-  if (isDirectOpenAIResponsesModel(model)) {
+export function remoteCompactionV2EndpointUrl(
+  model: Model<any>,
+  cfg: EligibilityConfig,
+): string {
+  // A gateway exposes the Responses path at its own base URL, so the same URL
+  // arithmetic applies as for a direct OpenAI model.
+  if (isDirectOpenAIResponsesModel(model) || isProxiedOpenAIResponsesModel(model, cfg)) {
     return resolveDirectOpenAIResponsesEndpoint(model);
   }
   if (isOpenAICodexResponsesModel(model)) {
@@ -217,14 +229,27 @@ function withRemoteCompactionV2Feature(headers: Record<string, string>): Record<
 export function buildRemoteCompactionHeaders(params: {
   model: Model<any>;
   apiKey: string;
-  headers?: Record<string, string>;
+  headers?: ProviderHeaders;
   sessionId?: string;
+  cfg: EligibilityConfig;
 }): Record<string, string> {
+  if (isProxiedOpenAIResponsesModel(params.model, params.cfg)) {
+    // No Codex identity headers and no `x-codex-beta-features` here: those exist
+    // to unlock the endpoint on OpenAI's own edge, and they carry a machine
+    // identifier that a third-party gateway has no reason to receive.
+    return {
+      authorization: `Bearer ${params.apiKey}`,
+      ...sanitizeProviderHeaders(params.headers),
+      accept: "text/event-stream",
+      "content-type": "application/json",
+    };
+  }
+
   const codexIdentityHeaders = buildCodexIdentityHeaders(params.sessionId);
   const commonHeaders = withRemoteCompactionV2Feature({
     authorization: `Bearer ${params.apiKey}`,
     ...codexIdentityHeaders,
-    ...(params.headers ?? {}),
+    ...sanitizeProviderHeaders(params.headers),
     accept: "text/event-stream",
     "content-type": "application/json",
   });
@@ -681,7 +706,7 @@ export async function generatePortableSummary(params: {
   messages: AgentMessage[];
   model: Model<any>;
   apiKey: string;
-  headers?: Record<string, string>;
+  headers?: ProviderHeaders;
   customInstructions?: string;
   signal?: AbortSignal;
   firstKeptEntryId: string;
@@ -725,7 +750,7 @@ export async function generateBestEffortLocalSummary(params: {
   messages: AgentMessage[];
   model: Model<any>;
   apiKey: string;
-  headers?: Record<string, string>;
+  headers?: ProviderHeaders;
   customInstructions?: string;
   signal?: AbortSignal;
   thinkingLevel?: ThinkingLevel;
@@ -739,7 +764,7 @@ export async function generateBestEffortLocalSummary(params: {
       params.preparation,
       params.model,
       params.apiKey,
-      params.headers,
+      sanitizeProviderHeaders(params.headers),
       params.customInstructions,
       params.signal,
       params.thinkingLevel,
@@ -919,7 +944,7 @@ export function parseRemoteCompactionV2Events(events: unknown[]): RemoteCompacti
 export async function callRemoteCompactionEndpoint(params: {
   model: Model<any>;
   apiKey: string;
-  headers?: Record<string, string>;
+  headers?: ProviderHeaders;
   sessionId?: string;
   input: ResponseItem[];
   instructions?: string;
@@ -928,18 +953,20 @@ export async function callRemoteCompactionEndpoint(params: {
   reasoning?: ResponsesReasoningConfig;
   text?: ResponsesTextConfig;
   signal?: AbortSignal;
+  cfg: EligibilityConfig;
 }): Promise<RemoteCompactionResult> {
-  if (!supportsRemoteCompactionModel(params.model)) {
+  if (!supportsRemoteCompactionModel(params.model, params.cfg)) {
     throw new Error("Remote compaction v2 is currently only enabled for supported OpenAI-compatible Responses models.");
   }
 
-  const response = await fetch(remoteCompactionV2EndpointUrl(params.model), {
+  const response = await fetch(remoteCompactionV2EndpointUrl(params.model, params.cfg), {
     method: "POST",
     headers: buildRemoteCompactionHeaders({
       model: params.model,
       apiKey: params.apiKey,
       headers: params.headers,
       sessionId: params.sessionId,
+      cfg: params.cfg,
     }),
     body: JSON.stringify(buildRemoteCompactionRequestBody({
       model: params.model,
@@ -1027,6 +1054,56 @@ function assistantMessageMatchesModelKey(
   return message.provider === target.provider && message.model === target.id;
 }
 
+/**
+ * An assistant turn Pi already discarded from model context.
+ *
+ * `context_edit` omissions are the normal case, but a failed or aborted turn
+ * whose retry budget ran out survives retry recovery without one, and it would
+ * otherwise be replayed into remote history forever — which is how a poisoned
+ * transcript becomes permanent.
+ */
+export function isDiscardedAssistantMessage(message: AgentMessage): boolean {
+  if (message.role !== "assistant") return false;
+  const stopReason = (message as { stopReason?: unknown }).stopReason;
+  return stopReason === "error" || stopReason === "aborted";
+}
+
+/**
+ * Branch message entries as the model saw them: `context_edit` omissions are
+ * dropped, content replacements are applied, and discarded assistant attempts
+ * are removed. Mirrors Pi's own projection closely enough for replay; it does
+ * not replicate compaction-boundary selection, which callers do themselves.
+ */
+export function projectBranchMessageEntries<
+  T extends { type: string; id: string; message?: AgentMessage },
+>(branchEntries: T[]): Array<T & { message: AgentMessage }> {
+  const edits = new Map<string, { content: unknown } | null>();
+  for (const entry of branchEntries) {
+    if (entry.type !== "context_edit") continue;
+    const record = entry as unknown as { targetId?: unknown; replacement?: unknown };
+    if (typeof record.targetId !== "string") continue;
+    const replacement = record.replacement;
+    if (replacement === null) {
+      edits.set(record.targetId, null);
+    } else if (isRecord(replacement) && "content" in replacement) {
+      edits.set(record.targetId, { content: replacement.content });
+    }
+  }
+
+  const projected: Array<T & { message: AgentMessage }> = [];
+  for (const entry of branchEntries) {
+    if (entry.type !== "message" || !entry.message) continue;
+    const edit = edits.get(entry.id);
+    if (edit === null) continue;
+    const message = edit
+      ? ({ ...entry.message, content: edit.content } as AgentMessage)
+      : entry.message;
+    if (isDiscardedAssistantMessage(message)) continue;
+    projected.push({ ...entry, message });
+  }
+  return projected;
+}
+
 export function reconstructRemoteCompactionStateFromBranch(params: {
   branchEntries: Array<{ type: string; id: string; details?: unknown; message?: AgentMessage }>;
 }): RemoteCompactionSessionState | undefined {
@@ -1043,17 +1120,26 @@ export function reconstructRemoteCompactionStateFromBranch(params: {
 
   if (!latestDetails || latestCompactionIndex < 0) return undefined;
 
+  // Edits can target entries on either side of the boundary, so project them
+  // across the whole branch and keep only the post-compaction message entries.
+  const projectedById = new Map(
+    projectBranchMessageEntries(params.branchEntries).map((projected) => [projected.id, projected.message]),
+  );
   const trailingMessages: ResponseItem[] = [];
   let pendingTurnItems: ResponseItem[] = [];
 
-  for (const entry of params.branchEntries.slice(latestCompactionIndex + 1)) {
+  for (let index = latestCompactionIndex + 1; index < params.branchEntries.length; index++) {
+    const entry = params.branchEntries[index];
     if (entry.type !== "message" || !entry.message) continue;
 
-    const items = messageToResponseItems(entry.message);
+    const message = projectedById.get(entry.id);
+    if (!message) continue;
+
+    const items = messageToResponseItems(message);
     if (items.length === 0) continue;
 
-    if (entry.message.role === "assistant") {
-      if (assistantMessageMatchesModelKey(entry.message, latestDetails.modelKey)) {
+    if (message.role === "assistant") {
+      if (assistantMessageMatchesModelKey(message, latestDetails.modelKey)) {
         trailingMessages.push(...pendingTurnItems, ...items);
       }
       pendingTurnItems = [];
