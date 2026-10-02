@@ -111,6 +111,78 @@ const {
   selectInputItemsForContinuation,
 } = await import(pathToFileURL(join(repoRoot, "src", "openai-ws-stream.ts")).href);
 
+// ---------------------------------------------------------------- transcript shim
+//
+// Pi 1.0.0 replaced the provider-facing `Context` with `TranscriptContext`, which
+// only carries `messages`: the system prompt and tool declarations are folded into a
+// leading `system` message. Reading `context.tools` / `context.systemPrompt` on 1.0.0
+// yields `undefined` and the provider then silently sends neither, so the requests
+// still succeed while the model refuses to use tools and ignores its instructions.
+//
+// These assertions pin the 1.0.0 transcript shape so that regression cannot return.
+const { contextSystemPrompt, contextTools } = await import(
+  pathToFileURL(join(repoRoot, "src", "transcript-compat.ts")).href,
+);
+
+const transcript100 = {
+  messages: [
+    {
+      role: "system",
+      content: "BASE PROMPT",
+      sections: { team: "TEAM SECTION" },
+      toolsAdded: [
+        { name: "read", description: "Read a file", parameters: { type: "object" } },
+      ],
+      timestamp: 0,
+    },
+    { role: "user", content: "hello" },
+  ],
+};
+assert.deepEqual(
+  contextTools(transcript100).map((tool) => tool.name),
+  ["read"],
+  "1.0.0 transcript: tools must be replayed out of the system message",
+);
+assert.equal(
+  contextSystemPrompt(transcript100),
+  "BASE PROMPT\n\nTEAM SECTION",
+  "1.0.0 transcript: prompt and sections must be replayed",
+);
+
+// Tool deltas apply in order: a later system message can remove and re-add.
+assert.deepEqual(
+  contextTools({
+    messages: [
+      { role: "system", content: "P", toolsAdded: [{ name: "read" }, { name: "bash" }], timestamp: 0 },
+      { role: "system", content: "", toolsRemoved: [{ name: "read" }], toolsAdded: [{ name: "grep" }], timestamp: 1 },
+    ],
+  }).map((tool) => tool.name),
+  ["bash", "grep"],
+  "tool deltas must apply as removals then additions, in order",
+);
+
+// The legacy 0.8x shape still wins when present, so behaviour there is unchanged.
+assert.deepEqual(
+  contextTools({ messages: [{ role: "system", content: "S" }], tools: [{ name: "legacy" }] }).map(
+    (tool) => tool.name,
+  ),
+  ["legacy"],
+  "legacy top-level tools must take precedence",
+);
+assert.equal(
+  contextSystemPrompt({ messages: [{ role: "system", content: "FROM TRANSCRIPT" }], systemPrompt: "LEGACY" }),
+  "LEGACY",
+  "legacy top-level systemPrompt must take precedence",
+);
+
+// No prompt anywhere must stay undefined, not "", so callers keep omitting `instructions`.
+assert.equal(
+  contextSystemPrompt({ messages: [{ role: "user", content: "hi" }] }),
+  undefined,
+  "absent prompt must be undefined rather than an empty string",
+);
+assert.deepEqual(contextTools({ messages: [] }), [], "absent tools must be an empty array");
+
 const targetModelKey = "openai:openai-responses:gpt-5.4-nano";
 const reconstructed = reconstructRemoteCompactionStateFromBranch({
   branchEntries: [

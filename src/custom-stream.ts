@@ -26,7 +26,7 @@ export const streamOpenAIResponsesWithPhase2B: StreamFunction = (
   if (!cfg.enabled || !isDirectOpenAIResponsesModel(model)) {
     return streamSimpleOpenAIResponses(
       model as Model<"openai-responses">,
-      context as Context,
+      context as Parameters<typeof streamSimpleOpenAIResponses>[1],
       options as SimpleStreamOptions | undefined,
     );
   }

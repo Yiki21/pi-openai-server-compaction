@@ -23,6 +23,7 @@ import {
   type StreamFunction,
 } from "@earendil-works/pi-ai";
 import { streamSimpleOpenAIResponses } from "@earendil-works/pi-ai/compat";
+import { contextSystemPrompt, contextTools } from "./transcript-compat.ts";
 import { loadConfig } from "./config.ts";
 import {
   isDirectOpenAIResponsesModel,
@@ -535,7 +536,7 @@ function buildAssistantMessageFromResponse(
           } catch {
             return {};
           }
-        })(),
+        })() as ToolCall["arguments"],
       });
     }
   }
@@ -587,7 +588,7 @@ function buildWsRequestKey(params: {
 }): string {
   return JSON.stringify({
     model: params.model.id,
-    instructions: params.context.systemPrompt ?? undefined,
+    instructions: contextSystemPrompt(params.context),
     tools: params.tools.length > 0 ? params.tools : undefined,
     temperature: params.options?.temperature,
     max_output_tokens: params.options?.maxTokens,
@@ -641,7 +642,7 @@ function buildResponseCreatePayload(params: {
     model: params.model.id,
     store: false,
     input: params.inputItems,
-    instructions: params.context.systemPrompt ?? undefined,
+    instructions: contextSystemPrompt(params.context),
     tools: params.tools.length > 0 ? params.tools : undefined,
     ...(params.previousResponseId ? { previous_response_id: params.previousResponseId } : {}),
     ...(params.options?.temperature !== undefined ? { temperature: params.options.temperature } : {}),
@@ -757,7 +758,14 @@ async function fallbackToHttp(
       return chained ?? nextPayload;
     },
   } satisfies SimpleStreamOptions | undefined;
-  const httpStream = streamSimpleOpenAIResponses(model, context, mergedOptions);
+  // The HTTP fallback reads only `context.messages`, which both shapes carry. Pi 1.0.0's
+  // `TranscriptContext` is structurally a Context, so the cast is safe and keeps this
+  // path working on the 0.8x line where the parameter really is a Context.
+  const httpStream = streamSimpleOpenAIResponses(
+    model,
+    context as Parameters<typeof streamSimpleOpenAIResponses>[1],
+    mergedOptions,
+  );
   for await (const event of httpStream) {
     eventStream.push(event);
   }
@@ -847,8 +855,8 @@ export function createOpenAIWebSocketStreamFn(
             await runWarmUp({
               manager: session.manager,
               modelId: model.id,
-              tools: convertTools(context.tools),
-              instructions: context.systemPrompt ?? undefined,
+              tools: convertTools(contextTools(context)),
+              instructions: contextSystemPrompt(context),
               signal,
             });
           } catch {
@@ -859,7 +867,7 @@ export function createOpenAIWebSocketStreamFn(
         const remoteCompactionState = getRemoteCompactionState(sessionId);
         const continuationState = getContinuationState(sessionId);
         const typedOptions = options as WsOptions | undefined;
-        const functionTools = convertTools(context.tools);
+        const functionTools = convertTools(contextTools(context));
         const requestKey = buildWsRequestKey({
           model,
           context,

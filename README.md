@@ -135,10 +135,10 @@ pi -e ./src/index.ts --model openai/gpt-5.6-luna
 ## Requirements
 
 - Node `>= 22`
-- Pi `>=0.80.9 <0.88.0`. The fork's gateway path is live-tested on 0.87.1. The
-  direct-OpenAI and Codex paths were live-tested upstream on 0.80.9; the fork's
-  `context_edit` projection also applies to them, but has only been covered by the
-  offline smoke test there.
+- Pi `>=0.80.9`. The fork's gateway path is live-tested on 0.87.1. The WebSocket path
+  reads the transcript shape introduced in Pi 1.0.0 (prompt and tools live in the
+  transcript's leading `system` message) and keeps working on the 0.8x line, where
+  `systemPrompt` and `tools` are still carried at the top level.
 - Auth/config for the model you want to use must already work in Pi
 - A supported OpenAI Responses model, e.g. `openai/gpt-5.6-sol` or `openai-codex/gpt-5.6-sol`
 

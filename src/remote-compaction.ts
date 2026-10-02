@@ -1051,7 +1051,10 @@ function assistantMessageMatchesModelKey(
   const target = parseModelKeyParts(targetModelKey);
   if (!target) return false;
   if (!isRecord(message)) return false;
-  return message.provider === target.provider && message.model === target.id;
+  // 1.0.0 widened AgentMessage so not every member carries provider/model;
+  // the isRecord guard above already makes reading them safe.
+  const m = message as { provider?: unknown; model?: unknown };
+  return m.provider === target.provider && m.model === target.id;
 }
 
 /**

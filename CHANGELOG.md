@@ -2,18 +2,51 @@
 
 This changelog intentionally starts at **0.1.0**.
 
-## Unreleased
+## 0.3.0 - 2026-10-02
+
+### Fix the system prompt and every tool being dropped on Pi 1.0.0
+
+Pi 1.0.0 replaced the provider-facing `Context` with `TranscriptContext`, which carries
+only `messages`: `systemPrompt` and `tools` are folded into a leading `system` message
+by `normalizeContext()`, and the top-level fields no longer exist.
+
+Reading them returned `undefined` rather than throwing, so on the WebSocket path — the
+**default** transport for direct `openai/*` Responses models — the extension requested
+tools with `tools: undefined` and no `instructions`, and the folded `system` message was
+discarded by `convertMessagesToInputItems` as well. The requests still succeeded, so the
+symptom was a model that simply never called a tool and ignored its instructions.
+
+New `src/transcript-compat.ts` resolves prompt and tools from either shape, preferring
+the legacy fields when populated so 0.8x behaviour is unchanged. The replay is
+implemented locally rather than imported from `@earendil-works/pi-ai/utils/transcript`
+because that subpath does not exist on the 0.8x line.
+
+### Fix a typecheck that could not see the break
+
+`npm test` passed throughout, because `tsc` resolved `@earendil-works/*` from devDeps
+pinned to `0.80.9` while the runtime API had moved on. The devDeps now track the current
+Pi, so the typecheck fails where the behaviour would.
+
+Also resolved the remaining errors against 1.0.0: `ToolCall.arguments` is now `JsonObject`,
+`AgentMessage` widened so `provider`/`model` need narrowing, and two casts that suppressed
+the `Context`/`TranscriptContext` mismatch were replaced with explicit, documented ones.
+
+### Add regression coverage for the transcript shape
+
+`scripts/smoke.mjs` now asserts that a 1.0.0 transcript is read correctly (tools replayed,
+prompt and sections replayed, tool deltas applied in order), that the legacy shape still
+takes precedence, and that an absent prompt stays `undefined` rather than becoming an
+empty string. Reintroducing the old field reads makes the suite fail.
+
+### Peer range
+
+The `>=0.80.9 <0.88.0` upper bound is gone — it excluded the versions whose contract the
+code was never updated to meet — and is now `>=0.80.9`.
 
 ### Upstream
 
-- target Pi 0.80.9 and the `@earendil-works/*` package namespace
-- align compaction fallback, Responses payload normalization, Codex identity headers, and WebSocket behavior with Pi 0.80.9
-- replace the legacy `/responses/compact` call with Codex's current Responses compaction v2 protocol
-- stream a normal Responses request with a trailing `compaction_trigger` and persist the returned `compaction` item
-- retain recent user messages with the same 20K-token budget shape used by Codex while continuing to read legacy version 1 session artifacts
 - add a reproducible native-vs-text compaction benchmark, retained GPT-5.6 Sol evidence, and a standalone report
 - add a fixed-context, information-density-calibrated product-defaults benchmark comparing Pi's real default compactor with the extension's real native replay policy
-- correct the earlier benchmark's same-budget interpretation: its text cap was selected after observing native output usage
 
 ## 0.2.1 - 2026-09-28
 
